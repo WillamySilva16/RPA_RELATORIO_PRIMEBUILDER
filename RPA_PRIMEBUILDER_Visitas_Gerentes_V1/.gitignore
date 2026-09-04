@@ -1,0 +1,7 @@
+.env
+credentials/
+downloads/*
+__pycache__/
+*.pyc
+erro_primebuilder.png
+*.log
