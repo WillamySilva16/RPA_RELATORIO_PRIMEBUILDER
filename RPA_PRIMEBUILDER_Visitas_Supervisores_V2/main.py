@@ -14,6 +14,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from urllib3.exceptions import ReadTimeoutError, MaxRetryError
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -204,6 +205,11 @@ def make_driver():
     )
 
     driver = webdriver.Chrome(options=options)
+
+    try:
+        driver.command_executor.set_timeout(600)
+    except Exception:
+        pass
 
     # Em modo headless (--headless=new) o Chrome bloqueia downloads por
     # padrão, mesmo com "download.default_directory" configurado nas
@@ -444,6 +450,99 @@ def select_model(driver):
         )
 
 
+def find_checkbox_by_label(driver, label_text):
+    """Localiza um <input type="checkbox"> a partir do texto do label associado.
+
+    Tenta, em ordem:
+    1) <label for="..."> apontando para o id do checkbox;
+    2) checkbox dentro do próprio <label>;
+    3) checkbox logo antes do <label> na árvore (padrão <input><label>Texto</label>).
+    """
+    target = normalize_text(label_text)
+
+    for lbl in driver.find_elements(By.XPATH, "//label"):
+        try:
+            if not lbl.is_displayed():
+                continue
+            if target not in normalize_text(lbl.text):
+                continue
+        except Exception:
+            continue
+
+        for_attr = lbl.get_attribute("for")
+        if for_attr:
+            try:
+                cb = driver.find_element(By.ID, for_attr)
+                if cb.get_attribute("type") == "checkbox":
+                    return cb
+            except Exception:
+                pass
+
+        try:
+            return lbl.find_element(By.XPATH, ".//input[@type='checkbox']")
+        except Exception:
+            pass
+
+        try:
+            return lbl.find_element(By.XPATH, "preceding-sibling::input[@type='checkbox'][1]")
+        except Exception:
+            pass
+
+    # Fallback: alguns formulários não usam <label>, e sim um texto solto
+    # (span/div) ao lado do checkbox. Procura o checkbox mais próximo de
+    # qualquer elemento visível cujo texto bata com o alvo.
+    xpath_text = (
+        "//*[self::span or self::div or self::td]"
+        f"[contains(translate(normalize-space(.), "
+        f"'ÁÀÂÃÉÊÍÓÔÕÚÜÇ', 'AAAAEEIOOOUUC'), "
+        f"translate('{label_text.upper()}', 'ÁÀÂÃÉÊÍÓÔÕÚÜÇ', 'AAAAEEIOOOUUC'))]"
+    )
+    for el in driver.find_elements(By.XPATH, xpath_text):
+        try:
+            if not el.is_displayed():
+                continue
+            cb = el.find_element(By.XPATH, "preceding::input[@type='checkbox'][1]")
+            return cb
+        except Exception:
+            continue
+
+    return None
+
+
+def check_only_last_transition(driver):
+    """Marca a caixa 'Somente última transição' no filtro do relatório.
+
+    Isso evita que o CSV traga uma linha por transição/fase da OS ao invés
+    de uma linha por OS, o que também ajuda a manter o upsert do Sheets
+    estável (chave única por OS).
+    """
+    label = "Somente última transição"
+    log(f"Marcando a opção '{label}'...")
+
+    checkbox = find_checkbox_by_label(driver, label)
+    if checkbox is None:
+        raise NoSuchElementException(
+            f"Checkbox '{label}' não encontrado no filtro do relatório."
+        )
+
+    if not checkbox.is_selected():
+        try:
+            checkbox.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", checkbox)
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                checkbox,
+            )
+
+    time.sleep(0.3)
+    confirmado = checkbox.is_selected()
+    log(f"'{label}' marcada: {confirmado}")
+
+    if not confirmado:
+        raise RuntimeError(f"Falha ao marcar a caixa '{label}'.")
+
+
 def select_only_finalizada(driver):
     target = "Finalizada"
     log("Selecionando SOMENTE o status 'Finalizada'...")
@@ -571,7 +670,7 @@ def click_export(driver):
         try:
             driver.execute_script("arguments[0].click();", elemento)
             log("Clique enviado via JavaScript.")
-        except TimeoutException:
+        except (TimeoutException, ReadTimeoutError, MaxRetryError):
             log(
                 "Chrome continua ocupado. Não será feito novo clique; "
                 "o robô aguardará o CSV."
@@ -812,6 +911,7 @@ def main():
 
         select_model(driver)
         select_only_finalizada(driver)
+        check_only_last_transition(driver)
 
         log(f"Preenchendo período: {inicial} até {final}")
         data_inicial, data_final = find_report_inputs(driver)
@@ -830,7 +930,7 @@ def main():
         click_export(driver)
 
         # Relatórios de períodos longos podem demorar vários minutos.
-        csv_path = wait_for_download(timeout=600)
+        csv_path = wait_for_download()
         df = read_csv(csv_path)
         upsert_sheet(df)
 

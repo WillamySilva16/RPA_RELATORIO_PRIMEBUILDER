@@ -444,6 +444,99 @@ def select_model(driver):
         )
 
 
+def find_checkbox_by_label(driver, label_text):
+    """Localiza um <input type="checkbox"> a partir do texto do label associado.
+
+    Tenta, em ordem:
+    1) <label for="..."> apontando para o id do checkbox;
+    2) checkbox dentro do próprio <label>;
+    3) checkbox logo antes do <label> na árvore (padrão <input><label>Texto</label>).
+    """
+    target = normalize_text(label_text)
+
+    for lbl in driver.find_elements(By.XPATH, "//label"):
+        try:
+            if not lbl.is_displayed():
+                continue
+            if target not in normalize_text(lbl.text):
+                continue
+        except Exception:
+            continue
+
+        for_attr = lbl.get_attribute("for")
+        if for_attr:
+            try:
+                cb = driver.find_element(By.ID, for_attr)
+                if cb.get_attribute("type") == "checkbox":
+                    return cb
+            except Exception:
+                pass
+
+        try:
+            return lbl.find_element(By.XPATH, ".//input[@type='checkbox']")
+        except Exception:
+            pass
+
+        try:
+            return lbl.find_element(By.XPATH, "preceding-sibling::input[@type='checkbox'][1]")
+        except Exception:
+            pass
+
+    # Fallback: alguns formulários não usam <label>, e sim um texto solto
+    # (span/div) ao lado do checkbox. Procura o checkbox mais próximo de
+    # qualquer elemento visível cujo texto bata com o alvo.
+    xpath_text = (
+        "//*[self::span or self::div or self::td]"
+        f"[contains(translate(normalize-space(.), "
+        f"'ÁÀÂÃÉÊÍÓÔÕÚÜÇ', 'AAAAEEIOOOUUC'), "
+        f"translate('{label_text.upper()}', 'ÁÀÂÃÉÊÍÓÔÕÚÜÇ', 'AAAAEEIOOOUUC'))]"
+    )
+    for el in driver.find_elements(By.XPATH, xpath_text):
+        try:
+            if not el.is_displayed():
+                continue
+            cb = el.find_element(By.XPATH, "preceding::input[@type='checkbox'][1]")
+            return cb
+        except Exception:
+            continue
+
+    return None
+
+
+def check_only_last_transition(driver):
+    """Marca a caixa 'Somente última transição' no filtro do relatório.
+
+    Isso evita que o CSV traga uma linha por transição/fase da OS ao invés
+    de uma linha por OS, o que também ajuda a manter o upsert do Sheets
+    estável (chave única por OS).
+    """
+    label = "Somente última transição"
+    log(f"Marcando a opção '{label}'...")
+
+    checkbox = find_checkbox_by_label(driver, label)
+    if checkbox is None:
+        raise NoSuchElementException(
+            f"Checkbox '{label}' não encontrado no filtro do relatório."
+        )
+
+    if not checkbox.is_selected():
+        try:
+            checkbox.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", checkbox)
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                checkbox,
+            )
+
+    time.sleep(0.3)
+    confirmado = checkbox.is_selected()
+    log(f"'{label}' marcada: {confirmado}")
+
+    if not confirmado:
+        raise RuntimeError(f"Falha ao marcar a caixa '{label}'.")
+
+
 def select_only_finalizada(driver):
     target = "Finalizada"
     log("Selecionando SOMENTE o status 'Finalizada'...")
@@ -692,8 +785,18 @@ def call_with_retry(func, *args, max_attempts=5, **kwargs):
                 f"Aguardando {wait}s...")
             time.sleep(wait)
 
-
 def upsert_sheet(df):
+    """
+    Atualiza a planilha por chave sem apagar dados existentes.
+
+    Regras:
+    - NUNCA usa ws.clear().
+    - Mantém as colunas já existentes na planilha.
+    - Se o CSV trouxer colunas novas, adiciona essas colunas ao final.
+    - Se a ordem das colunas do CSV mudar, faz o mapeamento pelo nome.
+    - Registros existentes são atualizados pela UPSERT_KEY.
+    - Registros novos são adicionados no final.
+    """
     ws = get_worksheet()
 
     if UPSERT_KEY not in df.columns:
@@ -702,91 +805,177 @@ def upsert_sheet(df):
             f"Colunas disponíveis: {list(df.columns)}"
         )
 
-    # Remove linhas vazias da chave.
+    # Remove linhas sem chave.
     df = df[df[UPSERT_KEY].astype(str).str.strip() != ""].copy()
 
-    # Garante cabeçalho.
-    headers = list(df.columns)
+    # Cabeçalho vindo do CSV.
+    csv_headers = [str(c).strip() for c in df.columns]
+
+    # Leitura atual da planilha.
     existing = ws.get_all_values()
 
+    # ============================================================
+    # CABEÇALHO
+    # ============================================================
     if not existing:
-        ws.update(range_name="A1", values=[headers], value_input_option="RAW")
-        existing = [headers]
-    elif existing[0] != headers:
-        # Mantém a planilha alinhada ao relatório exportado.
-        ws.clear()
-        ws.update(range_name="A1", values=[headers], value_input_option="RAW")
-        existing = [headers]
+        sheet_headers = csv_headers[:]
+        ws.update(
+            range_name="A1",
+            values=[sheet_headers],
+            value_input_option="RAW"
+        )
+        existing = [sheet_headers]
+        log("Planilha vazia: cabeçalho criado.")
+    else:
+        sheet_headers = [str(c).strip() for c in existing[0]]
 
-    # Mapeia Código da OS -> (número da linha, valores atuais na planilha).
-    key_col = headers.index(UPSERT_KEY)
+        # Remove células vazias do final do cabeçalho.
+        while sheet_headers and sheet_headers[-1] == "":
+            sheet_headers.pop()
+
+        # Adiciona somente colunas novas. NUNCA limpa a planilha.
+        new_headers = [c for c in csv_headers if c not in sheet_headers]
+
+        if new_headers:
+            old_count = len(sheet_headers)
+            sheet_headers.extend(new_headers)
+
+            # Atualiza somente a linha do cabeçalho, preservando os dados.
+            from gspread.utils import rowcol_to_a1
+            start_col = rowcol_to_a1(1, old_count + 1).replace("1", "")
+            end_col = rowcol_to_a1(1, len(sheet_headers)).replace("1", "")
+
+            ws.update(
+                range_name=f"{start_col}1:{end_col}1",
+                values=[new_headers],
+                value_input_option="RAW"
+            )
+
+            log(
+                f"Novas colunas adicionadas ao final da planilha: "
+                f"{new_headers}"
+            )
+
+        # Se a planilha estava com cabeçalho menor/incompleto, garante
+        # que o cabeçalho completo esteja gravado sem apagar nenhuma linha.
+        if len(existing[0]) != len(sheet_headers) or existing[0] != sheet_headers:
+            ws.update(
+                range_name="A1",
+                values=[sheet_headers],
+                value_input_option="RAW"
+            )
+
+            # Recarrega para trabalhar com o cabeçalho atualizado.
+            existing = ws.get_all_values()
+
+    # ============================================================
+    # MAPEAMENTO DAS COLUNAS
+    # ============================================================
+    key_col = sheet_headers.index(UPSERT_KEY)
+
+    # Índice das colunas do CSV.
+    csv_index = {header: i for i, header in enumerate(csv_headers)}
+
+    # Converte uma linha do CSV para a ordem das colunas da planilha.
+    def normalize_csv_row(csv_row):
+        return [
+            str(csv_row[csv_index[h]]) if h in csv_index else ""
+            for h in sheet_headers
+        ]
+
+    # ============================================================
+    # MAPA DAS LINHAS EXISTENTES
+    # ============================================================
     row_by_key = {}
 
     for row_number, row in enumerate(existing[1:], start=2):
         if len(row) > key_col:
             key = str(row[key_col]).strip()
+
             if key:
-                # Preenche com "" até o tamanho do cabeçalho, pois o Sheets
-                # não retorna células vazias no final da linha.
-                padded = row + [""] * (len(headers) - len(row))
-                row_by_key[key] = (row_number, padded[:len(headers)])
+                padded = row + [""] * (len(sheet_headers) - len(row))
+                row_by_key[key] = (
+                    row_number,
+                    padded[:len(sheet_headers)]
+                )
 
     updates = []
     appends = []
     unchanged = 0
 
-    for row in df.astype(str).values.tolist():
+    # ============================================================
+    # UPSERT
+    # ============================================================
+    for csv_row in df.astype(str).values.tolist():
+        row = normalize_csv_row(csv_row)
         key = row[key_col].strip()
+
+        if not key:
+            continue
 
         if key in row_by_key:
             row_number, current_row = row_by_key[key]
+
             if current_row == row:
                 unchanged += 1
-                continue
-            updates.append((row_number, row))
+            else:
+                updates.append((row_number, row))
         else:
             appends.append(row)
 
-    # Atualizações em lote.
-    # IMPORTANTE: nunca chamar ws.update() uma vez por linha — com milhares
-    # de registros isso estoura a cota do Sheets API (60 escritas/min/usuário,
-    # erro 429). Em vez disso, agrupamos tudo em chamadas batch_update,
-    # cada uma cobrindo várias faixas de células de uma só vez.
+    # ============================================================
+    # ATUALIZAÇÕES
+    # ============================================================
     if updates:
         from gspread.utils import rowcol_to_a1
 
-        BATCH_SIZE = 500  # faixas por chamada batch_update; margem segura
-        SLEEP_BETWEEN_BATCHES = 1.2  # segundos, para não estourar a cota
+        BATCH_SIZE = 500
+        SLEEP_BETWEEN_BATCHES = 1.2
 
         for i in range(0, len(updates), BATCH_SIZE):
             chunk = updates[i:i + BATCH_SIZE]
             body = []
+
             for row_number, row in chunk:
                 start = rowcol_to_a1(row_number, 1)
-                end = rowcol_to_a1(row_number, len(headers))
-                body.append({"range": f"{start}:{end}", "values": [row]})
+                end = rowcol_to_a1(row_number, len(sheet_headers))
 
-            # RAW é essencial aqui: com USER_ENTERED o Sheets interpreta o
-            # "Código da OS" (string de 16 dígitos) como NÚMERO, e ao ler de
-            # volta (get_all_values) o valor pode voltar formatado de forma
-            # diferente do CSV. Isso quebra o match da chave no upsert e faz
-            # o robô re-inserir linhas que já existiam (duplicação).
-            call_with_retry(ws.batch_update, body, value_input_option="RAW")
-            log(f"Lote de atualização enviado: {len(chunk)} linhas "
-                f"({i + len(chunk)}/{len(updates)})")
+                body.append({
+                    "range": f"{start}:{end}",
+                    "values": [row]
+                })
+
+            call_with_retry(
+                ws.batch_update,
+                body,
+                value_input_option="RAW"
+            )
+
+            log(
+                f"Lote de atualização enviado: "
+                f"{len(chunk)} linhas "
+                f"({i + len(chunk)}/{len(updates)})"
+            )
 
             if i + BATCH_SIZE < len(updates):
                 time.sleep(SLEEP_BETWEEN_BATCHES)
 
-    # Novas linhas.
+    # ============================================================
+    # NOVOS REGISTROS
+    # ============================================================
     if appends:
-        call_with_retry(ws.append_rows, appends, value_input_option="RAW")
+        call_with_retry(
+            ws.append_rows,
+            appends,
+            value_input_option="RAW"
+        )
 
     log(f"Atualizados: {len(updates)}")
     log(f"Inseridos:   {len(appends)}")
     log(f"Sem mudança: {unchanged}")
     log(f"Total CSV:   {len(df)}")
-
+    log(f"Colunas CSV: {len(csv_headers)}")
+    log(f"Colunas Sheet: {len(sheet_headers)}")
 
 def main():
     inicio_execucao = time.perf_counter()
@@ -812,6 +1001,7 @@ def main():
 
         select_model(driver)
         select_only_finalizada(driver)
+        check_only_last_transition(driver)
 
         log(f"Preenchendo período: {inicial} até {final}")
         data_inicial, data_final = find_report_inputs(driver)
