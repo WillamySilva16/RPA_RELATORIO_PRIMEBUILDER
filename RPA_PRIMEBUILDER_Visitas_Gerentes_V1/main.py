@@ -18,6 +18,9 @@ from selenium.webdriver.support import expected_conditions as EC
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
+
+import pb_novo_layout as pbnl  # adaptações ao layout novo do PrimeBuilder
+MODELO_RELATORIO = "RS - Gerente"
 LOG_DIR = BASE_DIR / "logs"
 CREDENTIALS_FILE = BASE_DIR / "credentials" / "service-account.json"
 
@@ -845,6 +848,16 @@ def upsert_sheet(df):
             start_col = rowcol_to_a1(1, old_count + 1).replace("1", "")
             end_col = rowcol_to_a1(1, len(sheet_headers)).replace("1", "")
 
+            # Garante que a grade da aba tem colunas suficientes.
+            # O Sheets não cria colunas sozinho num update de range.
+            if len(sheet_headers) > ws.col_count:
+                faltam = len(sheet_headers) - ws.col_count
+                log(
+                    f"Expandindo a aba '{ws.title}': +{faltam} coluna(s) "
+                    f"({ws.col_count} -> {len(sheet_headers)})"
+                )
+                ws.add_cols(faltam)
+
             ws.update(
                 range_name=f"{start_col}1:{end_col}1",
                 values=[new_headers],
@@ -998,9 +1011,12 @@ def main():
     try:
         driver = make_driver()
         login(driver)
+        time.sleep(2)
+        pbnl.fechar_popups(driver, log)
 
         select_model(driver)
-        select_only_finalizada(driver)
+        pbnl.fechar_popups(driver, log)
+        pbnl.select_only_finalizada(driver, log, BASE_DIR)
         check_only_last_transition(driver)
 
         log(f"Preenchendo período: {inicial} até {final}")
@@ -1017,10 +1033,16 @@ def main():
 
         time.sleep(1)
         clear_old_downloads()
+        pbnl.fechar_popups(driver, log)
+        antes_exportacao = pbnl.snapshot_exportacoes(driver, DOWNLOAD_DIR, log)
         click_export(driver)
 
         # Relatórios de períodos longos podem demorar vários minutos.
-        csv_path = wait_for_download(timeout=600)
+        csv_path = pbnl.wait_for_export(driver, log, DOWNLOAD_DIR, MODELO_RELATORIO, antes_exportacao, timeout=600)
+        if csv_path is None:
+            log("Nenhum registro no período. Planilha não foi alterada.", "SUCCESS")
+            return
+
         df = read_csv(csv_path)
         upsert_sheet(df)
 

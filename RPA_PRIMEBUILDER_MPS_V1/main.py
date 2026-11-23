@@ -25,6 +25,9 @@ from urllib3.exceptions import ReadTimeoutError, MaxRetryError
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
+
+import pb_novo_layout as pbnl  # adaptações ao layout novo do PrimeBuilder
+MODELO_RELATORIO = "#4 - Pesquisa de Satisfação (Antigo)"
 LOG_DIR = BASE_DIR / "logs"
 CREDENTIALS_FILE = BASE_DIR / "credentials" / "service-account.json"
 
@@ -1866,6 +1869,23 @@ def upsert_sheet(df):
 
         from gspread.utils import rowcol_to_a1
 
+        # Garante que a grade da aba tem colunas suficientes.
+        # O Sheets não cria colunas sozinho num update de range.
+        if end_col > ws.col_count:
+
+            faltam = end_col - ws.col_count
+
+            log(
+                f"Expandindo a aba '{ws.title}': "
+                f"+{faltam} coluna(s) "
+                f"({ws.col_count} -> {end_col})"
+            )
+
+            call_with_retry(
+                ws.add_cols,
+                faltam,
+            )
+
         start_a1 = rowcol_to_a1(
             1,
             start_col,
@@ -2242,6 +2262,10 @@ def main():
             driver
         )
 
+        time.sleep(2)
+
+        pbnl.fechar_popups(driver, log)
+
         # ----------------------------------------------------
         # FILTROS
         # ----------------------------------------------------
@@ -2250,9 +2274,9 @@ def main():
             driver
         )
 
-        select_only_finalizada(
-            driver
-        )
+        pbnl.fechar_popups(driver, log)
+
+        pbnl.select_only_finalizada(driver, log, BASE_DIR)
 
         check_only_last_transition(
             driver
@@ -2308,11 +2332,20 @@ def main():
 
         clear_old_downloads()
 
-        click_export(
-            driver
-        )
+        pbnl.fechar_popups(driver, log)
 
-        csv_path = wait_for_download()
+        antes_exportacao = pbnl.snapshot_exportacoes(driver, DOWNLOAD_DIR, log)
+
+        click_export(driver)
+
+        csv_path = pbnl.wait_for_export(driver, log, DOWNLOAD_DIR, MODELO_RELATORIO, antes_exportacao)
+
+        if csv_path is None:
+
+            log("Nenhum registro no período. Planilha não foi alterada.", "SUCCESS")
+
+            return
+
 
         # ----------------------------------------------------
         # LEITURA CSV

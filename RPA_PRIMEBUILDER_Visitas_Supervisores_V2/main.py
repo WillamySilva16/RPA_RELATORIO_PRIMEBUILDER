@@ -3,6 +3,7 @@ import re
 import time
 from pathlib import Path
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 import gspread
 import pandas as pd
@@ -19,6 +20,9 @@ from urllib3.exceptions import ReadTimeoutError, MaxRetryError
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
+
+import pb_novo_layout as pbnl  # adaptações ao layout novo do PrimeBuilder
+MODELO_RELATORIO = "Registro de Visita Supervisão"
 LOG_DIR = BASE_DIR / "logs"
 CREDENTIALS_FILE = BASE_DIR / "credentials" / "service-account.json"
 
@@ -792,99 +796,595 @@ def call_with_retry(func, *args, max_attempts=5, **kwargs):
             time.sleep(wait)
 
 
+def normalize_key(value):
+    """
+    Normaliza o Código da OS somente para COMPARAÇÃO.
+
+    Não altera o valor que será gravado na planilha.
+
+    Exemplos tratados:
+
+        1234567890123456
+        1234567890123456.0
+        1.234567890123456E+15
+
+    continuam sendo comparados como a mesma chave.
+    """
+
+    if value is None:
+        return ""
+
+    value = str(value).strip()
+
+    if not value:
+        return ""
+
+    # Mantém códigos alfanuméricos como estão.
+    if re.search(
+        r"[A-Za-z]",
+        value,
+    ):
+        return value.casefold()
+
+    # Se houver notação científica.
+    if re.search(
+        r"[eE][+-]?\d+",
+        value,
+    ):
+
+        try:
+
+            decimal_value = Decimal(
+                value.replace(",", ".")
+            )
+
+            if decimal_value == decimal_value.to_integral_value():
+
+                return format(
+                    decimal_value,
+                    "f",
+                ).split(".")[0]
+
+            return format(
+                decimal_value,
+                "f",
+            ).rstrip("0").rstrip(".")
+
+        except (
+            InvalidOperation,
+            ValueError,
+        ):
+
+            pass
+
+    # Trata números terminados em .0.
+    if re.fullmatch(
+        r"\d+\.0+",
+        value,
+    ):
+
+        return value.split(
+            "."
+        )[0]
+
+    return value.casefold()
+
+
+# ============================================================
+# UPSERT SEGURO
+# ============================================================
+
 def upsert_sheet(df):
+
+    """
+    Faz UPSERT no Google Sheets sem apagar a planilha.
+
+    Regras:
+
+    1. A chave é UPSERT_KEY, normalmente "Código da OS".
+    2. Nunca utiliza ws.clear().
+    3. O cabeçalho existente da planilha é preservado.
+    4. Colunas novas vindas do CSV são adicionadas ao final.
+    5. Colunas antigas que não vierem no CSV continuam existindo.
+    6. Registros existentes são atualizados pela chave.
+    7. Registros novos são adicionados no final.
+    8. A ordem das colunas no CSV pode mudar sem destruir a planilha.
+    """
+
     ws = get_worksheet()
 
+    # --------------------------------------------------------
+    # VALIDA CSV
+    # --------------------------------------------------------
+
     if UPSERT_KEY not in df.columns:
+
         raise ValueError(
-            f"A coluna-chave '{UPSERT_KEY}' não existe no CSV. "
+            f"A coluna-chave '{UPSERT_KEY}' "
+            f"não existe no CSV. "
             f"Colunas disponíveis: {list(df.columns)}"
         )
 
-    # Remove linhas vazias da chave.
-    df = df[df[UPSERT_KEY].astype(str).str.strip() != ""].copy()
+    # Remove registros sem chave.
+    df = df[
+        df[UPSERT_KEY]
+        .astype(str)
+        .str.strip()
+        != ""
+    ].copy()
 
-    # Garante cabeçalho.
-    headers = list(df.columns)
-    existing = ws.get_all_values()
+    if df.empty:
+
+        log(
+            "CSV não possui registros válidos para importar."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # LÊ A PLANILHA ATUAL
+    # --------------------------------------------------------
+
+    log(
+        "Lendo dados atuais da planilha..."
+    )
+
+    existing = call_with_retry(
+        ws.get_all_values
+    )
+
+    # --------------------------------------------------------
+    # PLANILHA VAZIA
+    # --------------------------------------------------------
 
     if not existing:
-        ws.update(range_name="A1", values=[headers], value_input_option="RAW")
-        existing = [headers]
-    elif existing[0] != headers:
-        # Mantém a planilha alinhada ao relatório exportado.
-        ws.clear()
-        ws.update(range_name="A1", values=[headers], value_input_option="RAW")
-        existing = [headers]
 
-    # Mapeia Código da OS -> (número da linha, valores atuais na planilha).
-    key_col = headers.index(UPSERT_KEY)
+        headers = list(df.columns)
+
+        log(
+            "Planilha vazia. Criando somente o cabeçalho."
+        )
+
+        call_with_retry(
+            ws.update,
+            range_name="A1",
+            values=[headers],
+            value_input_option="RAW",
+        )
+
+        existing = [
+            headers
+        ]
+
+    # --------------------------------------------------------
+    # CABEÇALHO EXISTENTE
+    # --------------------------------------------------------
+
+    sheet_headers = [
+        str(h).strip()
+        for h in existing[0]
+    ]
+
+    csv_headers = [
+        str(h).strip()
+        for h in df.columns
+    ]
+
+    # Remove cabeçalhos duplicados do CSV.
+    duplicated_headers = []
+
+    seen_headers = set()
+
+    for header in csv_headers:
+
+        normalized = normalize_text(
+            header
+        )
+
+        if normalized in seen_headers:
+
+            duplicated_headers.append(
+                header
+            )
+
+        else:
+
+            seen_headers.add(
+                normalized
+            )
+
+    if duplicated_headers:
+
+        raise ValueError(
+            "O CSV possui colunas duplicadas: "
+            f"{duplicated_headers}"
+        )
+
+    # --------------------------------------------------------
+    # GARANTE QUE A CHAVE EXISTE
+    # --------------------------------------------------------
+
+    if UPSERT_KEY not in sheet_headers:
+
+        # A planilha já possui dados, mas não possui a chave.
+        #
+        # Não vamos apagar nada.
+        # Adicionamos a coluna-chave no final e abortamos,
+        # porque não temos como reconstruir a chave histórica
+        # das linhas antigas com segurança.
+
+        raise RuntimeError(
+            f"A planilha '{ws.title}' possui dados, "
+            f"mas não possui a coluna-chave '{UPSERT_KEY}'. "
+            "Nenhum dado foi alterado. "
+            "Adicione a coluna-chave na planilha e execute novamente."
+        )
+
+    # --------------------------------------------------------
+    # ADICIONA COLUNAS NOVAS DO CSV
+    # --------------------------------------------------------
+
+    new_columns = [
+        col
+        for col in csv_headers
+        if col not in sheet_headers
+    ]
+
+    if new_columns:
+
+        log(
+            "Novas colunas detectadas no CSV: "
+            f"{new_columns}"
+        )
+
+        start_col = (
+            len(sheet_headers)
+            + 1
+        )
+
+        end_col = (
+            len(sheet_headers)
+            + len(new_columns)
+        )
+
+        from gspread.utils import rowcol_to_a1
+
+        # Garante que a grade da aba tem colunas suficientes.
+        # O Sheets não cria colunas sozinho num update de range.
+        if end_col > ws.col_count:
+
+            faltam = end_col - ws.col_count
+
+            log(
+                f"Expandindo a aba '{ws.title}': "
+                f"+{faltam} coluna(s) "
+                f"({ws.col_count} -> {end_col})"
+            )
+
+            call_with_retry(
+                ws.add_cols,
+                faltam,
+            )
+
+        start_a1 = rowcol_to_a1(
+            1,
+            start_col,
+        )
+
+        end_a1 = rowcol_to_a1(
+            1,
+            end_col,
+        )
+
+        call_with_retry(
+            ws.update,
+            range_name=f"{start_a1}:{end_a1}",
+            values=[new_columns],
+            value_input_option="RAW",
+        )
+
+        sheet_headers.extend(
+            new_columns
+        )
+
+        log(
+            f"{len(new_columns)} nova(s) coluna(s) adicionada(s) "
+            "sem apagar os dados existentes."
+        )
+
+    # --------------------------------------------------------
+    # MAPEIA COLUNAS
+    # --------------------------------------------------------
+
+    sheet_col_index = {
+        header: index
+        for index, header
+        in enumerate(sheet_headers)
+    }
+
+    csv_col_index = {
+        header: index
+        for index, header
+        in enumerate(csv_headers)
+    }
+
+    key_col_sheet = sheet_col_index[
+        UPSERT_KEY
+    ]
+
+    # --------------------------------------------------------
+    # MAPEIA OS EXISTENTES
+    # --------------------------------------------------------
+
     row_by_key = {}
 
-    for row_number, row in enumerate(existing[1:], start=2):
-        if len(row) > key_col:
-            key = str(row[key_col]).strip()
-            if key:
-                # Preenche com "" até o tamanho do cabeçalho, pois o Sheets
-                # não retorna células vazias no final da linha.
-                padded = row + [""] * (len(headers) - len(row))
-                row_by_key[key] = (row_number, padded[:len(headers)])
+    for row_number, row in enumerate(
+        existing[1:],
+        start=2,
+    ):
+
+        # Preenche células vazias no final da linha.
+        padded = list(row)
+
+        if len(padded) < len(sheet_headers):
+
+            padded.extend(
+                [""] *
+                (
+                    len(sheet_headers)
+                    - len(padded)
+                )
+            )
+
+        key_value = padded[
+            key_col_sheet
+        ]
+
+        key = normalize_key(
+            key_value
+        )
+
+        if not key:
+
+            continue
+
+        # Se houver duplicidade histórica,
+        # mantém a primeira ocorrência.
+        if key not in row_by_key:
+
+            row_by_key[key] = (
+                row_number,
+                padded[:len(sheet_headers)],
+            )
+
+    log(
+        f"Registros existentes na planilha: "
+        f"{len(row_by_key)}"
+    )
+
+    # --------------------------------------------------------
+    # PREPARA UPSERT
+    # --------------------------------------------------------
 
     updates = []
     appends = []
     unchanged = 0
 
-    for row in df.astype(str).values.tolist():
-        key = row[key_col].strip()
+    # Mapeia quais colunas do CSV correspondem
+    # às colunas da planilha.
+    mapped_columns = []
+
+    for csv_header in csv_headers:
+
+        mapped_columns.append(
+            (
+                csv_col_index[csv_header],
+                sheet_col_index[csv_header],
+            )
+        )
+
+    # --------------------------------------------------------
+    # PROCESSA CADA REGISTRO DO CSV
+    # --------------------------------------------------------
+
+    for csv_row in df.astype(str).values.tolist():
+
+        # Começa pela chave do CSV.
+        csv_key_value = csv_row[
+            csv_col_index[UPSERT_KEY]
+        ]
+
+        key = normalize_key(
+            csv_key_value
+        )
+
+        if not key:
+
+            continue
+
+        # ====================================================
+        # REGISTRO JÁ EXISTE
+        # ====================================================
 
         if key in row_by_key:
-            row_number, current_row = row_by_key[key]
-            if current_row == row:
-                unchanged += 1
-                continue
-            updates.append((row_number, row))
-        else:
-            appends.append(row)
 
-    # Atualizações em lote.
-    # IMPORTANTE: nunca chamar ws.update() uma vez por linha — com milhares
-    # de registros isso estoura a cota do Sheets API (60 escritas/min/usuário,
-    # erro 429). Em vez disso, agrupamos tudo em chamadas batch_update,
-    # cada uma cobrindo várias faixas de células de uma só vez.
+            row_number, current_row = (
+                row_by_key[key]
+            )
+
+            # Faz uma cópia da linha atual.
+            final_row = list(
+                current_row
+            )
+
+            # Atualiza SOMENTE as colunas que
+            # vieram no CSV.
+            for csv_index, sheet_index in mapped_columns:
+
+                value = csv_row[
+                    csv_index
+                ]
+
+                final_row[
+                    sheet_index
+                ] = value
+
+            # Verifica se realmente mudou.
+            if final_row == current_row:
+
+                unchanged += 1
+
+                continue
+
+            updates.append(
+                (
+                    row_number,
+                    final_row,
+                )
+            )
+
+        # ====================================================
+        # REGISTRO NOVO
+        # ====================================================
+
+        else:
+
+            # Cria uma linha do tamanho
+            # EXATO da planilha.
+            new_row = [
+                ""
+                for _
+                in sheet_headers
+            ]
+
+            # Coloca os dados do CSV
+            # nas respectivas colunas.
+            for csv_index, sheet_index in mapped_columns:
+
+                new_row[
+                    sheet_index
+                ] = csv_row[
+                    csv_index
+                ]
+
+            appends.append(
+                new_row
+            )
+
+    # --------------------------------------------------------
+    # ATUALIZAÇÕES
+    # --------------------------------------------------------
+
     if updates:
+
         from gspread.utils import rowcol_to_a1
 
-        BATCH_SIZE = 500  # faixas por chamada batch_update; margem segura
-        SLEEP_BETWEEN_BATCHES = 1.2  # segundos, para não estourar a cota
+        BATCH_SIZE = 300
 
-        for i in range(0, len(updates), BATCH_SIZE):
-            chunk = updates[i:i + BATCH_SIZE]
+        SLEEP_BETWEEN_BATCHES = 1.2
+
+        for i in range(
+            0,
+            len(updates),
+            BATCH_SIZE,
+        ):
+
+            chunk = updates[
+                i:i + BATCH_SIZE
+            ]
+
             body = []
+
             for row_number, row in chunk:
-                start = rowcol_to_a1(row_number, 1)
-                end = rowcol_to_a1(row_number, len(headers))
-                body.append({"range": f"{start}:{end}", "values": [row]})
 
-            # RAW é essencial aqui: com USER_ENTERED o Sheets interpreta o
-            # "Código da OS" (string de 16 dígitos) como NÚMERO, e ao ler de
-            # volta (get_all_values) o valor pode voltar formatado de forma
-            # diferente do CSV. Isso quebra o match da chave no upsert e faz
-            # o robô re-inserir linhas que já existiam (duplicação).
-            call_with_retry(ws.batch_update, body, value_input_option="RAW")
-            log(f"Lote de atualização enviado: {len(chunk)} linhas "
-                f"({i + len(chunk)}/{len(updates)})")
+                start = rowcol_to_a1(
+                    row_number,
+                    1,
+                )
 
-            if i + BATCH_SIZE < len(updates):
-                time.sleep(SLEEP_BETWEEN_BATCHES)
+                end = rowcol_to_a1(
+                    row_number,
+                    len(sheet_headers),
+                )
 
-    # Novas linhas.
+                body.append(
+                    {
+                        "range": (
+                            f"{start}:{end}"
+                        ),
+                        "values": [
+                            row
+                        ],
+                    }
+                )
+
+            call_with_retry(
+                ws.batch_update,
+                body,
+                value_input_option="RAW",
+            )
+
+            log(
+                f"Lote de atualização enviado: "
+                f"{len(chunk)} linhas "
+                f"({i + len(chunk)}/{len(updates)})"
+            )
+
+            if (
+                i + BATCH_SIZE
+                < len(updates)
+            ):
+
+                time.sleep(
+                    SLEEP_BETWEEN_BATCHES
+                )
+
+    # --------------------------------------------------------
+    # NOVAS LINHAS
+    # --------------------------------------------------------
+
     if appends:
-        call_with_retry(ws.append_rows, appends, value_input_option="RAW")
 
-    log(f"Atualizados: {len(updates)}")
-    log(f"Inseridos:   {len(appends)}")
-    log(f"Sem mudança: {unchanged}")
-    log(f"Total CSV:   {len(df)}")
+        call_with_retry(
+            ws.append_rows,
+            appends,
+            value_input_option="RAW",
+        )
+
+    # --------------------------------------------------------
+    # LOG FINAL
+    # --------------------------------------------------------
+
+    log(
+        f"Atualizados: {len(updates)}"
+    )
+
+    log(
+        f"Inseridos:   {len(appends)}"
+    )
+
+    log(
+        f"Sem mudança: {unchanged}"
+    )
+
+    log(
+        f"Total CSV:   {len(df)}"
+    )
+
+    if new_columns:
+
+        log(
+            f"Colunas novas: {len(new_columns)}"
+        )
+
+    log(
+        "UPSERT concluído sem limpar a planilha."
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 
 def main():
@@ -908,9 +1408,12 @@ def main():
     try:
         driver = make_driver()
         login(driver)
+        time.sleep(2)
+        pbnl.fechar_popups(driver, log)
 
         select_model(driver)
-        select_only_finalizada(driver)
+        pbnl.fechar_popups(driver, log)
+        pbnl.select_only_finalizada(driver, log, BASE_DIR)
         check_only_last_transition(driver)
 
         log(f"Preenchendo período: {inicial} até {final}")
@@ -927,10 +1430,16 @@ def main():
 
         time.sleep(1)
         clear_old_downloads()
+        pbnl.fechar_popups(driver, log)
+        antes_exportacao = pbnl.snapshot_exportacoes(driver, DOWNLOAD_DIR, log)
         click_export(driver)
 
         # Relatórios de períodos longos podem demorar vários minutos.
-        csv_path = wait_for_download()
+        csv_path = pbnl.wait_for_export(driver, log, DOWNLOAD_DIR, MODELO_RELATORIO, antes_exportacao)
+        if csv_path is None:
+            log("Nenhum registro no período. Planilha não foi alterada.", "SUCCESS")
+            return
+
         df = read_csv(csv_path)
         upsert_sheet(df)
 
