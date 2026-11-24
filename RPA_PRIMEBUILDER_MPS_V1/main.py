@@ -2270,73 +2270,10 @@ def main():
         # FILTROS
         # ----------------------------------------------------
 
-        select_model(
-            driver
-        )
-
+        # Filtros e exportação: pedido direto ao site (layout de 24/11/2026).
         pbnl.fechar_popups(driver, log)
-
-        pbnl.select_only_finalizada(driver, log, BASE_DIR)
-
-        check_only_last_transition(
-            driver
-        )
-
-        # ----------------------------------------------------
-        # DATAS
-        # ----------------------------------------------------
-
-        log(
-            f"Preenchendo período: "
-            f"{inicial} até {final}"
-        )
-
-        data_inicial, data_final = (
-            find_report_inputs(
-                driver
-            )
-        )
-
-        set_date_input(
-            driver,
-            data_inicial,
-            inicial,
-        )
-
-        set_date_input(
-            driver,
-            data_final,
-            final,
-        )
-
-        try:
-
-            driver.find_element(
-                By.TAG_NAME,
-                "h1",
-            ).click()
-
-        except Exception:
-
-            driver.execute_script(
-                "document.body.click();"
-            )
-
-        time.sleep(
-            1
-        )
-
-        # ----------------------------------------------------
-        # EXPORTAÇÃO
-        # ----------------------------------------------------
-
-        clear_old_downloads()
-
-        pbnl.fechar_popups(driver, log)
-
         antes_exportacao = pbnl.snapshot_exportacoes(driver, DOWNLOAD_DIR, log)
-
-        click_export(driver)
+        pbnl.exportar_via_api(driver, log, MODELO_RELATORIO, inicial, final)
 
         csv_path = pbnl.wait_for_export(driver, log, DOWNLOAD_DIR, MODELO_RELATORIO, antes_exportacao)
 

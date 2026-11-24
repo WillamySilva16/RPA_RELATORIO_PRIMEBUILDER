@@ -226,16 +226,19 @@ for (const t of document.querySelectorAll('table')) {
     const iMod = cab.indexOf('modelo');
     const iTipo = cab.indexOf('tipo');
     const iSit = cab.findIndex(c => c.startsWith('situa'));
-    const iLin = cab.indexOf('linhas');
+    const iLin = cab.findIndex(c => c.startsWith('linhas'));
+    const primeira = v => (v || '').split('\n')[0].trim();
     return [...t.querySelectorAll('tbody tr')].map((tr, idx) => {
         const td = [...tr.querySelectorAll('td')].map(x => x.innerText.trim());
+        const lin = iLin >= 0 ? (td[iLin] || '') : '';
+        const num = lin.match(/^\s*([\d.]+)/);
         return {
             idx,
-            pedida: td[iPed] || '',
-            modelo: td[iMod] || '',
-            tipo: td[iTipo] || '',
-            situacao: td[iSit] || '',
-            linhas: iLin >= 0 ? td[iLin] : '',
+            pedida: primeira(td[iPed]),
+            modelo: primeira(td[iMod]),
+            tipo: primeira(td[iTipo]),
+            situacao: primeira(td[iSit]),
+            linhas: num ? num[1].replace(/\./g, '') : lin,
         };
     });
 }
@@ -496,8 +499,10 @@ def wait_for_export(driver, log, download_dir, model_name, antes, timeout=None):
             ultimo_status = minha["situacao"]
 
         sit = _norm(minha["situacao"])
-        if sit.startswith("pronta") and str(minha["linhas"]).strip() == "0":
-            log("Exportação pronta com 0 linhas: nada para baixar neste período.")
+        if sit.startswith("sem tarefas") or (
+            sit.startswith("pronta") and str(minha["linhas"]).strip() == "0"
+        ):
+            log(f"Exportação sem registros ({minha['situacao']}): nada para baixar.")
             return None
         if sit.startswith("pronta"):
             info = driver.execute_script(_JS_INFO_BAIXAR, minha["idx"]) or {}
@@ -579,3 +584,133 @@ def fechar_popups(driver, log=print, tentativas=3):
         pass
     if total:
         log(f"Pop-up fechado: {total}")
+
+
+
+# ============================================================
+# EXPORTAÇÃO PELA CHAMADA INTERNA DO SITE (sem clicar nos filtros)
+# ============================================================
+#
+# Desde 24/11/2026 os filtros ficam numa gaveta lateral. Em vez de clicar
+# neles, o robô faz o mesmo pedido que o botão "Exportar - Fases por Coluna"
+# faz por baixo dos panos:
+#
+#   POST /Frontend/TransitionsLayoutReport/EnfileirarExportacao
+#
+# O pedido roda DENTRO do navegador já logado (fetch com a sessão), então
+# não é preciso lidar com cookies no Python.
+
+EXPORT_URL = "/Frontend/TransitionsLayoutReport/EnfileirarExportacao"
+
+_JS_ID_LAYOUT = r"""
+const alvo = arguments[0];
+const norm = s => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+                    .toLowerCase().replace(/\s+/g, ' ').trim();
+for (const o of document.querySelectorAll('select option')) {
+    if (norm(o.text) === norm(alvo) && o.value) return o.value;
+}
+return null;
+"""
+
+_JS_POST_FORM = r"""
+const url = arguments[0];
+const pares = arguments[1];
+const done = arguments[arguments.length - 1];
+const body = new URLSearchParams();
+for (const [k, v] of pares) body.append(k, v);
+fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+    },
+    body,
+})
+  .then(async r => done({ok: r.ok, status: r.status, texto: (await r.text()).slice(0, 2000)}))
+  .catch(e => done({erro: String(e)}));
+"""
+
+
+def obter_id_layout(driver, model_name, log=print):
+    """Descobre o IdLayout do modelo pelo <select> 'Modelo de Dados' da página.
+
+    Pode ser fixado no .env com PRIME_ID_LAYOUT, se o site esconder o select.
+    """
+    fixo = os.getenv("PRIME_ID_LAYOUT", "").strip()
+    if fixo:
+        return fixo
+    fim = time.time() + 20
+    while time.time() < fim:
+        valor = driver.execute_script(_JS_ID_LAYOUT, model_name)
+        if valor:
+            log(f"IdLayout de '{model_name}': {valor}")
+            return str(valor)
+        time.sleep(1)
+    raise NoSuchElementException(
+        f"Não achei o IdLayout do modelo '{model_name}'. "
+        "Coloque PRIME_ID_LAYOUT=<número> no .env deste robô."
+    )
+
+
+def exportar_via_api(driver, log, model_name, inicio, fim,
+                     somente_ultima_transicao=True, tipo_exportacao="2"):
+    """
+    Pede a exportação 'Fases por Coluna' direto ao servidor.
+
+    inicio/fim: 'DD/MM/AAAA' (data de agendamento).
+    Status: Finalizada (ID 2). Pode ser mudado com PRIME_STATUS_IDS=2,5 no .env.
+    """
+    id_layout = obter_id_layout(driver, model_name, log)
+    status_ids = [x.strip() for x in os.getenv("PRIME_STATUS_IDS", "2").split(",") if x.strip()]
+
+    pares = [
+        ["exportType", tipo_exportacao],        # 2 = Fases por Coluna
+        ["IdLayout", id_layout],
+        ["TypeFilterDate", "schedule"],         # Data de Agendamento
+        ["ScheduleStart", inicio],
+        ["ScheduleEnd", fim],
+    ]
+    if somente_ultima_transicao:
+        pares.append(["OnlyLastTransition", "true"])
+    pares += [
+        ["OnlyLastTransition", "false"],        # padrão de checkbox do ASP.NET
+        ["ReplicateHeader", "false"],
+        ["TasksUnsynchronized", "false"],
+    ]
+    for sid in status_ids:
+        pares.append(["ServiceRequestStatusesSelected", sid])
+    pares.append(["Context", "Workspace"])
+
+    log(
+        f"Pedindo exportação via site: modelo={model_name} (IdLayout {id_layout}), "
+        f"{inicio} até {fim}, status={status_ids}, "
+        f"somente última transição={somente_ultima_transicao}"
+    )
+
+    try:
+        driver.set_script_timeout(120)
+    except Exception:
+        pass
+    r = driver.execute_async_script(_JS_POST_FORM, EXPORT_URL, pares)
+
+    if not r or r.get("erro") or not r.get("ok"):
+        raise RuntimeError(
+            f"O site recusou o pedido de exportação: {r and (r.get('erro') or r.get('status'))} "
+            f"{(r or {}).get('texto', '')[:300]}"
+        )
+
+    texto = (r.get("texto") or "").strip()
+    if texto.lower().startswith("<!doctype") or texto.lower().startswith("<html"):
+        raise RuntimeError(
+            "O pedido de exportação voltou uma página HTML (sessão expirada ou rota mudou)."
+        )
+    log(f"Pedido de exportação aceito. Resposta do site: {texto[:300]}")
+
+    # Recarrega para a tabela 'Exportações' mostrar o pedido novo.
+    time.sleep(2)
+    driver.refresh()
+    time.sleep(3)
+    fechar_popups(driver, log)
+    return texto
